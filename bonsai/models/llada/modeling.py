@@ -26,6 +26,8 @@ from jax import P
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, DTypeLike
 from tqdm import trange
+
+from bonsai.utils.attention import flex_attention
 from bonsai.utils.rope import RoPE, apply_rope
 
 LARGE_NEGATIVE = jnp.finfo(jnp.float32).min
@@ -181,36 +183,6 @@ class RMSNorm(nnx.Module):
 
 
 def sharded_attention(
-    q,
-    k,
-    v,
-    mask,
-    scale=None,
-    *,
-    attn_logit_sharding: PartitionSpec,
-    out_sharding: PartitionSpec,
-    rate: float | None,
-    key: Array,
-):
-    logits = jnp.einsum("BTNH,BSNH->BNTS", q, k, out_sharding=attn_logit_sharding)
-    scale_val = (1.0 / jnp.sqrt(k.shape[-1])) if scale is None else scale
-    logits *= jnp.array(scale_val, dtype=logits.dtype)
-
-    if mask is None:
-        probs = jax.nn.softmax(logits.astype(np.float32), axis=-1).astype(k.dtype)
-    else:
-        padded_logits = jnp.where(mask[:, None, :, :], logits.astype(np.float32), LARGE_NEGATIVE)
-        probs = jax.nn.softmax(padded_logits, axis=-1).astype(k.dtype)
-
-    if rate is not None and rate > 0.0:
-        keep_prob = 1.0 - rate
-        mask = jax.random.bernoulli(key, p=keep_prob, shape=probs.shape)
-        probs = jax.lax.select(mask, probs / keep_prob, jnp.zeros_like(probs))
-
-    attn_out = jnp.einsum("BNTS,BSNH->BTNH", probs, v, out_sharding=out_sharding)
-    return attn_out
-
-
 class LLaDALlamaBlock(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.config = cfg
@@ -263,7 +235,7 @@ class LLaDALlamaBlock(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array, sin: Array, cos: Array, attention_bias: Array | None, key: Array) -> Array:
+    def __call__(self, x: Array, sin: Array, cos: Array, attention_mask: Array | None, key: Array) -> Array:
         x_normed = self.attn_norm(x)
         new_shape = (*x.shape[:-1], -1, self.head_dim)
         shd = self.config.shd_cfg.activation
@@ -275,17 +247,15 @@ class LLaDALlamaBlock(nnx.Module):
         k = apply_rope(k, sin, cos)
 
         intermediate_shd = self.config.shd_cfg.attn_qk_activation
-        key, subkey = jax.random.split(key)
-        attn = sharded_attention(
+        attn = flex_attention(
             q,
             k,
             v,
-            attention_bias,
-            attn_logit_sharding=intermediate_shd,
-            out_sharding=shd,
-            rate=self.attn_drop,
-            key=subkey,
+            mask=attention_mask,
+            is_causal=False,
         )
+        # Note: Dropout is currently not supported inside flex_attention, 
+        # so we rely on the residual dropout instead, which is standard.
         attn = self.attn_out(attn.reshape(x.shape), out_sharding=shd)
 
         key, subkey = jax.random.split(key)

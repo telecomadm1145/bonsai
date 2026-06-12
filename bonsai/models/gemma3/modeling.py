@@ -29,6 +29,8 @@ from jax._src.nn.functions import _apply_masks
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 
+from bonsai.utils.attention import flex_attention
+
 
 class AttentionMode(Enum):
     FULL = "full_attention"
@@ -260,24 +262,6 @@ class ModelConfig:
 
 
 # --- General Components --- #
-# adapted from the jax.nn.dot_product_attention implementation
-def sharded_attention(q, k, v, mask, scale=None, *, attn_logit_sharding: PartitionSpec, out_sharding: PartitionSpec):
-    logits = jnp.einsum("BTNH,BSNH->BNTS", q, k, out_sharding=attn_logit_sharding)
-    scale_val = (1.0 / np.sqrt(k.shape[-1])) if scale is None else scale
-    logits *= jnp.array(scale_val, dtype=logits.dtype)
-
-    is_causal = False
-    local_window_size, q_seqlen, kv_seqlen = None, None, None
-    padded_logits = _apply_masks(logits, mask, is_causal, q_seqlen, kv_seqlen, local_window_size)
-
-    padded_logits = padded_logits.astype(np.float32)
-    probs = jax.nn.softmax(padded_logits, axis=-1).astype(k.dtype)
-    # TODO: Add dropout here
-
-    attn_out = jnp.einsum("BNTS,BSNH->BTNH", probs, v, out_sharding=out_sharding)
-    return attn_out
-
-
 # --- Vision Components --- #
 # TODO: update to include interpolate_pos_encoding
 class SiglipVisionEmbeddings(nnx.Module):
@@ -336,10 +320,10 @@ class SiglipAttention(nnx.Module):
         k = self.k_proj(x, out_sharding=shd).reshape(shape)
         v = self.v_proj(x, out_sharding=shd).reshape(shape)
 
-        intermediate_shd = self.config.shd_cfg.attn_qk_activation
-        attn = sharded_attention(
-            q, k, v, mask=attn_mask, attn_logit_sharding=intermediate_shd, out_sharding=shd
+        attn = flex_attention(
+            q, k, v, mask=attn_mask, is_causal=False
         ).reshape(x.shape)
+        attn = shard(attn, shd)
         return self.out_proj(attn, out_sharding=shd)
 
 
@@ -625,9 +609,11 @@ class Gemma3Attention(nnx.Module):
 
         k, v = repeat_kv(cache.k_cache[...], self.n_rep), repeat_kv(cache.v_cache[...], self.n_rep)
         intermediate_shd = self.config.shd_cfg.attn_qk_activation
-        qkv = sharded_attention(
-            q, k, v, mask=mask, scale=self.scale, attn_logit_sharding=intermediate_shd, out_sharding=shd
+        qkv = flex_attention(
+            q, k, v, mask=mask, scale=self.scale, is_causal=False
         )
+        qkv = shard(qkv, intermediate_shd)
+        qkv = shard(qkv, shd)
         t = x.shape[1]
         cache.cur_ind.set_value(cache.cur_ind[...] + t)
         return self.o_proj(qkv.reshape(*x.shape[:-1], -1), out_sharding=shd)
