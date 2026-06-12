@@ -1,9 +1,49 @@
 import dataclasses
 
+from enum import Enum
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax import Array
+from jax import Array, P
+from jax.sharding import PartitionSpec, reshard
+
+class ShardMode(Enum):
+    FSDP = "fsdp"
+    TP = "tp"
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ShardConfig:
+    patch_embed_weight: PartitionSpec | None = None
+    linear_weight: PartitionSpec | None = None
+    qkv_weight: PartitionSpec | None = None
+    mlp_weight: PartitionSpec | None = None
+    layer_norm: PartitionSpec | None = None
+    activation: PartitionSpec | None = None
+    attn_qk_activation: PartitionSpec | None = None
+
+    @staticmethod
+    def no_sharding():
+        return ShardConfig()
+
+    @staticmethod
+    def default(use_fsdp: bool, use_tp: bool):
+        fsdp = ShardMode.FSDP.value if use_fsdp else None
+        tp = ShardMode.TP.value if use_tp else None
+        return ShardConfig(
+            patch_embed_weight=P(None, None, None, tp, fsdp),
+            linear_weight=P(tp, fsdp),
+            qkv_weight=P(tp, fsdp),
+            mlp_weight=P(tp, fsdp),
+            layer_norm=P(tp),
+            activation=P(fsdp, None, tp),
+            attn_qk_activation=P(fsdp, None, tp, None),
+        )
+
+def shard(x: jnp.ndarray, s: PartitionSpec | None):
+    if s is None:
+        return x
+    else:
+        return reshard(x, s)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -29,35 +69,43 @@ class ModelConfig:
     pred_mlp_ratio: float = 4.0
     num_pooler_layers: int = 3
     num_labels: int = 174
+    shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.no_sharding)
 
     @classmethod
-    def vitl_fpc64_256(cls):
-        return cls()
+    def vitl_fpc64_256(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
+        return cls(shd_cfg=shd_cfg)
 
     @classmethod
-    def vith_fpc64_256(cls):
-        return cls(hidden_size=2180, num_attention_heads=16, num_hidden_layers=32)
+    def vith_fpc64_256(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
+        return cls(hidden_size=2180, num_attention_heads=16, num_hidden_layers=32, shd_cfg=shd_cfg)
 
     @classmethod
-    def vitg_fpc64_256(cls):
-        return cls(hidden_size=1408, num_attention_heads=22, num_hidden_layers=40, mlp_ratio=4.363636363636363)
+    def vitg_fpc64_256(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
+        return cls(hidden_size=1408, num_attention_heads=22, num_hidden_layers=40, mlp_ratio=4.363636363636363, shd_cfg=shd_cfg)
 
     @classmethod
-    def vitg_fpc64_384(cls):
+    def vitg_fpc64_384(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
         return cls(
-            crop_size=384, hidden_size=1408, num_attention_heads=22, num_hidden_layers=40, mlp_ratio=4.363636363636363
+            crop_size=384, hidden_size=1408, num_attention_heads=22, num_hidden_layers=40, mlp_ratio=4.363636363636363, shd_cfg=shd_cfg
         )
 
     @classmethod
-    def vitl_fpc16_256(cls):
-        return cls(frames_per_clip=16)
+    def vitl_fpc16_256(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
+        return cls(frames_per_clip=16, shd_cfg=shd_cfg)
 
     @classmethod
-    def vitl_fpc32_256(cls):
-        return cls(frames_per_clip=32, num_labels=48)
+    def vitl_fpc32_256(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
+        return cls(frames_per_clip=32, num_labels=48, shd_cfg=shd_cfg)
 
     @classmethod
-    def vitg_fpc32_384(cls):
+    def vitg_fpc32_384(cls, use_fsdp: bool = False, use_tp: bool = False):
+        shd_cfg = ShardConfig.default(use_fsdp, use_tp) if (use_fsdp or use_tp) else ShardConfig.no_sharding()
         return cls(
             frames_per_clip=32,
             crop_size=384,
@@ -65,6 +113,7 @@ class ModelConfig:
             num_attention_heads=22,
             num_hidden_layers=40,
             mlp_ratio=4.363636363636363,
+            shd_cfg=shd_cfg,
         )
 
     @classmethod
@@ -92,15 +141,16 @@ ACT2FN = {"gelu": gelu_exact, "silu": nnx.silu, "relu": nnx.relu}
 class VJEPA2PatchEmbeddings3D(nnx.Module):
     def __init__(self, config: ModelConfig, hidden_size: int, rngs: nnx.Rngs):
         super().__init__()
+        self.shd = config.shd_cfg
         self.hidden_size = hidden_size
         kernel = (config.tubelet_size, config.patch_size, config.patch_size)
         self.proj = nnx.Conv(
-            in_features=config.in_chans, out_features=hidden_size, kernel_size=kernel, strides=kernel, rngs=rngs
+            in_features=config.in_chans, out_features=hidden_size, kernel_size=kernel, strides=kernel, kernel_metadata={"out_sharding": self.shd.patch_embed_weight}, rngs=rngs
         )
 
     def __call__(self, pixel_values_videos: Array) -> Array:
         batch_size = pixel_values_videos.shape[0]
-        x = self.proj(pixel_values_videos)
+        x = shard(self.proj(pixel_values_videos), self.shd.activation)
         x = x.reshape(batch_size, -1, self.hidden_size)
         return x
 
@@ -150,6 +200,7 @@ def rotate_queries_or_keys(x: Array, pos: Array, dim: int) -> Array:
 class VJEPA2RopeAttention(nnx.Module):
     def __init__(self, config: ModelConfig, hidden_size: int, num_attention_heads: int, rngs: nnx.Rngs):
         super().__init__()
+        self.shd = config.shd_cfg
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
 
@@ -159,10 +210,10 @@ class VJEPA2RopeAttention(nnx.Module):
         self.attention_head_size = hidden_size // num_attention_heads
         self.all_head_size = num_attention_heads * self.attention_head_size
 
-        self.query = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, rngs=rngs)
-        self.key = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, rngs=rngs)
-        self.value = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, rngs=rngs)
-        self.proj = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.query = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.key = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.value = nnx.Linear(hidden_size, self.all_head_size, use_bias=config.qkv_bias, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.proj = nnx.Linear(hidden_size, hidden_size, kernel_metadata={"out_sharding": self.shd.linear_weight}, rngs=rngs)
 
         self.grid_size = config.crop_size // config.patch_size
         self.grid_depth = config.frames_per_clip // config.tubelet_size
@@ -228,9 +279,9 @@ class VJEPA2RopeAttention(nnx.Module):
     def __call__(self, hidden_states: Array, position_mask: Array | None = None) -> Array:
         batch_size, seq_length, _ = hidden_states.shape
 
-        query_layer = self.query(hidden_states)
-        key_layer = self.key(hidden_states)
-        value_layer = self.value(hidden_states)
+        query_layer = shard(self.query(hidden_states), self.shd.activation)
+        key_layer = shard(self.key(hidden_states), self.shd.activation)
+        value_layer = shard(self.value(hidden_states), self.shd.activation)
 
         query_layer = query_layer.reshape(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
         query_layer = query_layer.transpose(0, 2, 1, 3)
@@ -245,29 +296,34 @@ class VJEPA2RopeAttention(nnx.Module):
         query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
         key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
 
-        attn_weights = jnp.matmul(query_layer, key_layer.transpose(0, 1, 3, 2)) * self.scaling
-        attn_weights = nnx.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(query_layer.dtype)
-
-        context_layer = jnp.matmul(attn_weights, value_layer)
-        context_layer = context_layer.transpose(0, 2, 1, 3)
+        from bonsai.utils.attention import flex_attention
+        context_layer = flex_attention(
+            query_layer.transpose(0, 2, 1, 3),
+            key_layer.transpose(0, 2, 1, 3),
+            value_layer.transpose(0, 2, 1, 3),
+            scale=self.scaling,
+            is_causal=False
+        )
+        context_layer = shard(context_layer, self.shd.attn_qk_activation)
         context_layer = context_layer.reshape(batch_size, seq_length, self.all_head_size)
 
-        output = self.proj(context_layer)
+        output = shard(self.proj(context_layer), self.shd.activation)
         return output
 
 
 class VJEPA2MLP(nnx.Module):
     def __init__(self, config: ModelConfig, hidden_size: int, mlp_ratio: float, rngs: nnx.Rngs):
         super().__init__()
+        self.shd = config.shd_cfg
         hidden_features = int(hidden_size * mlp_ratio)
-        self.fc1 = nnx.Linear(hidden_size, hidden_features, rngs=rngs)
-        self.fc2 = nnx.Linear(hidden_features, hidden_size, rngs=rngs)
+        self.fc1 = nnx.Linear(hidden_size, hidden_features, kernel_metadata={"out_sharding": self.shd.mlp_weight}, rngs=rngs)
+        self.fc2 = nnx.Linear(hidden_features, hidden_size, kernel_metadata={"out_sharding": self.shd.linear_weight}, rngs=rngs)
         self.activation = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
-        hidden_states = self.fc1(hidden_states)
+        hidden_states = shard(self.fc1(hidden_states), self.shd.activation)
         hidden_states = self.activation(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = shard(self.fc2(hidden_states), self.shd.activation)
         return hidden_states
 
 
@@ -276,11 +332,12 @@ class VJEPA2Layer(nnx.Module):
         self, config: ModelConfig, hidden_size: int, num_attention_heads: int, mlp_ratio: float, rngs: nnx.Rngs
     ):
         super().__init__()
-        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        from functools import partial
+        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.attention = VJEPA2RopeAttention(
             config, hidden_size=hidden_size, num_attention_heads=num_attention_heads, rngs=rngs
         )
-        self.norm2 = nnx.LayerNorm(hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio, rngs=rngs)
 
     def __call__(self, hidden_states: Array, position_mask: Array | None = None) -> Array:
@@ -313,7 +370,8 @@ class VJEPA2Encoder(nnx.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.layernorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        from functools import partial
+        self.layernorm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
 
     def __call__(self, pixel_values_videos: Array) -> Array:
         hidden_states = self.embeddings(pixel_values_videos)
@@ -338,7 +396,7 @@ class VJEPA2PredictorEmbeddings(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
-        self.predictor_embeddings = nnx.Linear(config.hidden_size, config.pred_hidden_size, rngs=rngs)
+        self.predictor_embeddings = nnx.Linear(config.hidden_size, config.pred_hidden_size, kernel_metadata={"out_sharding": config.shd_cfg.linear_weight}, rngs=rngs)
 
         if config.pred_zero_init_mask_tokens:
             mask_tokens = jnp.zeros((config.pred_num_mask_tokens, 1, 1, config.pred_hidden_size))
@@ -352,7 +410,7 @@ class VJEPA2PredictorEmbeddings(nnx.Module):
         self, hidden_states: Array, context_mask: list, target_mask: list, mask_index: int = 1
     ) -> tuple[Array, Array]:
         batch_size = hidden_states.shape[0]
-        context = self.predictor_embeddings(hidden_states)
+        context = shard(self.predictor_embeddings(hidden_states), self.config.shd_cfg.activation)
 
         mask_index = mask_index % self.config.pred_num_mask_tokens
         target_token = self.mask_tokens[mask_index]
@@ -374,6 +432,7 @@ class VJEPA2PredictorEmbeddings(nnx.Module):
 class VJEPA2Predictor(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
+        self.config = config
         self.embeddings = VJEPA2PredictorEmbeddings(config, rngs=rngs)
         self.layer = nnx.List(
             [
@@ -387,8 +446,9 @@ class VJEPA2Predictor(nnx.Module):
                 for _ in range(config.pred_num_hidden_layers)
             ]
         )
-        self.layernorm = nnx.LayerNorm(config.pred_hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
-        self.proj = nnx.Linear(config.pred_hidden_size, config.hidden_size, rngs=rngs)
+        from functools import partial
+        self.layernorm = nnx.LayerNorm(config.pred_hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
+        self.proj = nnx.Linear(config.pred_hidden_size, config.hidden_size, kernel_metadata={"out_sharding": config.shd_cfg.linear_weight}, rngs=rngs)
 
     def sort_tokens(self, hidden_states: Array, position_masks: Array, argsort: Array) -> tuple[Array, Array]:
         position_masks = jnp.take_along_axis(position_masks, argsort, axis=1)
@@ -417,7 +477,7 @@ class VJEPA2Predictor(nnx.Module):
         hidden_states = self.layernorm(hidden_states)
         hidden_states = self.unsort_tokens(hidden_states, argsort)
         hidden_states = hidden_states[:, n_ctxt:]
-        hidden_states = self.proj(hidden_states)
+        hidden_states = shard(self.proj(hidden_states), self.config.shd_cfg.activation)
 
         return hidden_states
 
@@ -425,65 +485,71 @@ class VJEPA2Predictor(nnx.Module):
 class VJEPA2PoolerSelfAttention(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
+        self.shd = config.shd_cfg
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
-        self.k_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
-        self.v_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
-        self.out_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
+        self.q_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.k_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.v_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.out_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.linear_weight}, rngs=rngs)
 
     def __call__(self, hidden_states: Array) -> Array:
         batch_size, seq_length, _ = hidden_states.shape
 
-        queries = self.q_proj(hidden_states)
-        keys = self.k_proj(hidden_states)
-        values = self.v_proj(hidden_states)
+        queries = shard(self.q_proj(hidden_states), self.shd.activation)
+        keys = shard(self.k_proj(hidden_states), self.shd.activation)
+        values = shard(self.v_proj(hidden_states), self.shd.activation)
 
-        queries = queries.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        attn_weights = jnp.matmul(queries, keys.transpose(0, 1, 3, 2)) * self.scale
-        attn_weights = nnx.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(queries.dtype)
-
-        attn_output = jnp.matmul(attn_weights, values)
+        from bonsai.utils.attention import flex_attention
+        attn_output = flex_attention(
+            queries.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
+            keys.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
+            values.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
+            scale=self.scale,
+            is_causal=False
+        )
+        attn_output = shard(attn_output, self.shd.attn_qk_activation)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.embed_dim)
 
-        return self.out_proj(attn_output)
+        attn_output = shard(self.out_proj(attn_output), self.shd.activation)
+
+        return attn_output
 
 
 class VJEPA2PoolerCrossAttention(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
+        self.shd = config.shd_cfg
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
-        self.k_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
-        self.v_proj = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
+        self.q_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.k_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
+        self.v_proj = nnx.Linear(self.embed_dim, self.embed_dim, kernel_metadata={"out_sharding": self.shd.qkv_weight}, rngs=rngs)
 
     def __call__(self, queries: Array, keys: Array, values: Array) -> Array:
         batch_size, q_seq_length, _ = queries.shape
         kv_seq_length = keys.shape[1]
 
-        queries = self.q_proj(queries)
-        keys = self.k_proj(keys)
-        values = self.v_proj(values)
+        queries = shard(self.q_proj(queries), self.shd.activation)
+        keys = shard(self.k_proj(keys), self.shd.activation)
+        values = shard(self.v_proj(values), self.shd.activation)
 
-        queries = queries.reshape(batch_size, q_seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        attn_weights = jnp.matmul(queries, keys.transpose(0, 1, 3, 2)) * self.scale
-        attn_weights = nnx.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(queries.dtype)
-
-        attn_output = jnp.matmul(attn_weights, values)
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, q_seq_length, self.embed_dim)
+        from bonsai.utils.attention import flex_attention
+        attn_output = flex_attention(
+            queries.reshape(batch_size, q_seq_length, self.num_heads, self.head_dim),
+            keys.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim),
+            values.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim),
+            scale=self.scale,
+            is_causal=False
+        )
+        attn_output = shard(attn_output, self.shd.attn_qk_activation)
+        attn_output = attn_output.reshape(batch_size, q_seq_length, self.embed_dim)
 
         return attn_output
 
@@ -491,9 +557,10 @@ class VJEPA2PoolerCrossAttention(nnx.Module):
 class VJEPA2PoolerSelfAttentionLayer(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
-        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        from functools import partial
+        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.self_attn = VJEPA2PoolerSelfAttention(config, rngs=rngs)
-        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size, mlp_ratio=config.mlp_ratio, rngs=rngs)
 
     def __call__(self, hidden_states: Array) -> Array:
@@ -513,9 +580,10 @@ class VJEPA2PoolerSelfAttentionLayer(nnx.Module):
 class VJEPA2PoolerCrossAttentionLayer(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
-        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        from functools import partial
+        self.layer_norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.cross_attn = VJEPA2PoolerCrossAttention(config, rngs=rngs)
-        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        self.layer_norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=partial(jax.nn.initializers.ones, out_sharding=config.shd_cfg.layer_norm), bias_init=partial(jax.nn.initializers.zeros, out_sharding=config.shd_cfg.layer_norm), rngs=rngs)
         self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size, mlp_ratio=config.mlp_ratio, rngs=rngs)
 
     def __call__(self, queries: Array, hidden_state: Array) -> Array:
@@ -605,13 +673,13 @@ class VJEPA2ForVideoClassification(nnx.Module):
         self.num_labels = config.num_labels
         self.vjepa2 = VJEPA2Model(config, rngs=rngs)
         self.pooler = VJEPA2AttentivePooler(config, rngs=rngs)
-        self.classifier = nnx.Linear(config.hidden_size, config.num_labels, rngs=rngs)
+        self.classifier = nnx.Linear(config.hidden_size, config.num_labels, kernel_metadata={"out_sharding": config.shd_cfg.linear_weight}, rngs=rngs)
 
     def __call__(self, pixel_values_videos: Array) -> dict[str, Array]:
         outputs = self.vjepa2(pixel_values_videos, skip_predictor=True)
         last_hidden_state = outputs["last_hidden_state"]
         pooler_output = self.pooler(last_hidden_state)
-        logits = self.classifier(pooler_output)
+        logits = shard(self.classifier(pooler_output), self.config.shd_cfg.activation)
         return {"logits": logits, "last_hidden_state": last_hidden_state}
 
 

@@ -15,12 +15,63 @@
 import copy
 import dataclasses
 import math
+from enum import Enum
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax import P
 from jax._src.typing import DTypeLike
 from jax.lax import Precision
+from jax.sharding import PartitionSpec, reshard
+
+class ShardMode(Enum):
+    FSDP = "fsdp"
+    TP = "tp"
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ShardConfig:
+    emb_weight: PartitionSpec | None = None
+    q_weight: PartitionSpec | None = None
+    k_weight: PartitionSpec | None = None
+    v_weight: PartitionSpec | None = None
+    o_weight: PartitionSpec | None = None
+    wi_0_weight: PartitionSpec | None = None
+    wi_1_weight: PartitionSpec | None = None
+    wo_weight: PartitionSpec | None = None
+    rel_pos_bias_weight: PartitionSpec | None = None
+    activation: PartitionSpec | None = None
+    attn_qk_activation: PartitionSpec | None = None
+    layer_norm: PartitionSpec | None = None
+
+    @staticmethod
+    def no_sharding():
+        return ShardConfig()
+
+    @staticmethod
+    def default(use_fsdp: bool, use_tp: bool):
+        fsdp = ShardMode.FSDP.value if use_fsdp else None
+        tp = ShardMode.TP.value if use_tp else None
+        return ShardConfig(
+            emb_weight=P(tp, fsdp),
+            q_weight=P(tp, fsdp),
+            k_weight=P(tp, fsdp),
+            v_weight=P(tp, fsdp),
+            o_weight=P(tp, fsdp),
+            wi_0_weight=P(fsdp, tp),
+            wi_1_weight=P(fsdp, tp),
+            wo_weight=P(tp, fsdp),
+            rel_pos_bias_weight=P(tp, fsdp),
+            activation=P(fsdp, None, tp),
+            attn_qk_activation=P(fsdp, tp),
+            layer_norm=P(tp),
+        )
+
+def shard(x: jnp.ndarray, s: PartitionSpec | None):
+    if s is None:
+        return x
+    else:
+        return reshard(x, s)
 
 ACT_FN = {
     "gelu": nnx.gelu,
@@ -61,6 +112,7 @@ class ModelConfig:
     decoder_start_token_id: int = 0
     is_decoder: bool = False
     dtype: DTypeLike = jnp.float32
+    shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.no_sharding)
 
     def __post_init__(self):
         self.num_decoder_layers = (
@@ -92,11 +144,12 @@ class T5LayerNorm(nnx.Module):
         *,
         eps=1e-6,
         param_dtype: jnp.dtype | None = jnp.float32,
+        shd: PartitionSpec | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.scale = nnx.Param(jnp.ones(dim), dtype=param_dtype)
+        self.scale = nnx.Param(shard(jnp.ones(dim, dtype=param_dtype), shd))
 
     def __call__(self, hidden_states: jax.Array):
         # RMS normalization: hidden_states / sqrt(mean(hidden_states^2))
@@ -118,6 +171,7 @@ class UMT5DenseActDense(nnx.Module):
         rngs: nnx.Rngs,
     ):
         super().__init__()
+        self.config = config
         self.param_dtype = param_dtype
         self.is_gated_act = is_gated_act
         if self.is_gated_act:
@@ -127,6 +181,7 @@ class UMT5DenseActDense(nnx.Module):
                 precision=Precision.HIGHEST,
                 param_dtype=param_dtype,
                 use_bias=False,
+                kernel_metadata={"out_sharding": config.shd_cfg.wi_0_weight},
                 rngs=rngs,
             )
             self.wi_1 = nnx.Linear(
@@ -135,6 +190,7 @@ class UMT5DenseActDense(nnx.Module):
                 precision=Precision.HIGHEST,
                 param_dtype=param_dtype,
                 use_bias=False,
+                kernel_metadata={"out_sharding": config.shd_cfg.wi_1_weight},
                 rngs=rngs,
             )
 
@@ -145,23 +201,27 @@ class UMT5DenseActDense(nnx.Module):
                 precision=Precision.HIGHEST,
                 param_dtype=param_dtype,
                 use_bias=False,
+                kernel_metadata={"out_sharding": config.shd_cfg.wi_0_weight},
                 rngs=rngs,
             )
         self.wo = nnx.Linear(
-            config.d_ff, config.d_model, precision=Precision.HIGHEST, param_dtype=param_dtype, use_bias=False, rngs=rngs
+            config.d_ff, config.d_model, precision=Precision.HIGHEST, param_dtype=param_dtype, use_bias=False, kernel_metadata={"out_sharding": config.shd_cfg.wo_weight}, rngs=rngs
         )
         self.dropout = nnx.Dropout(config.dropout_rate, deterministic=False, rngs=rngs)
         self.act = ACT_FN[config.dense_act_fn]
 
     def __call__(self, hidden_states: jax.Array):
         if self.is_gated_act:
-            hidden_states = self.act(self.wi_0(hidden_states)) * self.wi_1(hidden_states)
+            wi_0 = shard(self.wi_0(hidden_states), self.config.shd_cfg.activation)
+            wi_1 = shard(self.wi_1(hidden_states), self.config.shd_cfg.activation)
+            hidden_states = self.act(wi_0) * wi_1
         else:
-            hidden_states = self.act(self.wi(hidden_states))
+            wi = shard(self.wi(hidden_states), self.config.shd_cfg.activation)
+            hidden_states = self.act(wi)
 
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.wo(hidden_states)
-        return hidden_states
+        return shard(hidden_states, self.config.shd_cfg.activation)
 
 
 class UMT5LayerFF(nnx.Module):
@@ -170,7 +230,7 @@ class UMT5LayerFF(nnx.Module):
         self.DenseReluDense = UMT5DenseActDense(
             config, is_gated_act=config.is_gated_act, param_dtype=param_dtype, rngs=rngs
         )
-        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype, shd=config.shd_cfg.layer_norm)
         self.dropout = nnx.Dropout(config.dropout_rate, deterministic=False, rngs=rngs)
 
     def __call__(self, hidden_states: jax.Array):
@@ -204,12 +264,15 @@ class UMT5Attention(nnx.Module):
         self.n_heads = config.num_heads
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
+        self.config = config
+        shd = config.shd_cfg
         self.q = nnx.Linear(
             self.d_model,
             self.inner_dim,
             precision=Precision.HIGHEST,
             param_dtype=param_dtype,
             use_bias=False,
+            kernel_metadata={"out_sharding": shd.q_weight},
             rngs=rngs,
         )
         self.k = nnx.Linear(
@@ -218,6 +281,7 @@ class UMT5Attention(nnx.Module):
             precision=Precision.HIGHEST,
             param_dtype=param_dtype,
             use_bias=False,
+            kernel_metadata={"out_sharding": shd.k_weight},
             rngs=rngs,
         )
         self.v = nnx.Linear(
@@ -226,6 +290,7 @@ class UMT5Attention(nnx.Module):
             precision=Precision.HIGHEST,
             param_dtype=param_dtype,
             use_bias=False,
+            kernel_metadata={"out_sharding": shd.v_weight},
             rngs=rngs,
         )
         self.o = nnx.Linear(
@@ -234,6 +299,7 @@ class UMT5Attention(nnx.Module):
             precision=Precision.HIGHEST,
             param_dtype=param_dtype,
             use_bias=False,
+            kernel_metadata={"out_sharding": shd.o_weight},
             rngs=rngs,
         )
 
@@ -241,7 +307,7 @@ class UMT5Attention(nnx.Module):
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nnx.Embed(
-                self.relative_attention_num_buckets, self.n_heads, param_dtype=param_dtype, rngs=rngs
+                self.relative_attention_num_buckets, self.n_heads, param_dtype=param_dtype, embedding_metadata={"out_sharding": shd.rel_pos_bias_weight}, rngs=rngs
             )
 
     def _relative_position_bucket(self, rel_pos):
@@ -293,9 +359,9 @@ class UMT5Attention(nnx.Module):
         is_cross_attention = encoder_hidden_states is not None
         current_states = encoder_hidden_states if is_cross_attention else hidden_states
 
-        q = self.q(hidden_states).reshape(b, -1, n, c)
-        k = self.k(current_states).reshape(b, -1, n, c)
-        v = self.v(current_states).reshape(b, -1, n, c)
+        q = shard(self.q(hidden_states), self.config.shd_cfg.activation).reshape(b, -1, n, c)
+        k = shard(self.k(current_states), self.config.shd_cfg.activation).reshape(b, -1, n, c)
+        v = shard(self.v(current_states), self.config.shd_cfg.activation).reshape(b, -1, n, c)
 
         # Attention bias
         q_len, k_len = q.shape[1], k.shape[1]
@@ -308,29 +374,11 @@ class UMT5Attention(nnx.Module):
         if attention_mask is not None:
             position_bias = position_bias + attention_mask
 
-        attn = (
-            jnp.einsum(
-                "binc,bjnc->bnij",
-                q,
-                k,
-                precision=Precision.HIGHEST,
-            )
-            + position_bias
-        )
-
-        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(attn.dtype)
-
-        attn = self.dropout(attn)
-
-        o_attn = jnp.einsum(
-            "bnij,bjnc->binc",
-            attn,
-            v,
-            precision=Precision.HIGHEST,
-        )
-
+        from bonsai.utils.attention import flex_attention
+        o_attn = flex_attention(q, k, v, bias=position_bias, is_causal=False)
+        o_attn = shard(o_attn, self.config.shd_cfg.attn_qk_activation)
         o_attn = o_attn.reshape(b, -1, n * c)
-        o_attn = self.o(o_attn)
+        o_attn = shard(self.o(o_attn), self.config.shd_cfg.activation)
         o_attn = self.dropout(o_attn)
         return o_attn
 
@@ -352,7 +400,7 @@ class UMT5LayerSelfAttention(nnx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype, shd=config.shd_cfg.layer_norm)
 
     def __call__(
         self,
@@ -381,7 +429,7 @@ class UMT5LayerCrossAttention(nnx.Module):
         self.EncDecAttention = UMT5Attention(
             config, has_relative_attention_bias=False, layer_idx=layer_idx, param_dtype=param_dtype, rngs=rngs
         )
-        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype, shd=config.shd_cfg.layer_norm)
         self.dropout = nnx.Dropout(config.dropout_rate, deterministic=False, rngs=rngs)
 
     def __call__(
@@ -451,12 +499,13 @@ class UMT5Block(nnx.Module):
 class UMT5Stack(nnx.Module):
     def __init__(self, config: ModelConfig, *, param_dtype: jnp.dtype | None = jnp.float32, rngs: nnx.Rngs):
         super().__init__()
-        self.embed_tokens = nnx.Embed(config.vocab_size, config.d_model, param_dtype=param_dtype, rngs=rngs)
+        self.config = config
+        self.embed_tokens = nnx.Embed(config.vocab_size, config.d_model, param_dtype=param_dtype, embedding_metadata={"out_sharding": config.shd_cfg.emb_weight}, rngs=rngs)
         self.is_decoder = config.is_decoder
         self.block = nnx.List(
             [UMT5Block(config, layer_idx=i, param_dtype=param_dtype, rngs=rngs) for i in range(config.num_layers)]
         )
-        self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype)
+        self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, param_dtype=param_dtype, shd=config.shd_cfg.layer_norm)
         self.dropout = nnx.Dropout(config.dropout_rate, deterministic=False, rngs=rngs)
 
     def _prepare_4d_causal_attention_mask_for_decoder(
@@ -544,7 +593,7 @@ class UMT5Stack(nnx.Module):
         encoder_hidden_states: jax.Array = None,
         encoder_attention_mask: jax.Array = None,
     ):
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = shard(self.embed_tokens(input_ids), self.config.shd_cfg.activation)
         hidden_states = self.dropout(inputs_embeds)
 
         # prepare attention mask for encoder and decoder
@@ -626,6 +675,7 @@ class UMT5Model(nnx.Module):
             use_bias=False,
             precision=Precision.HIGHEST,
             param_dtype=param_dtype,
+            kernel_metadata={"out_sharding": config.shd_cfg.emb_weight},
             rngs=rngs,
         )
 
@@ -653,6 +703,8 @@ class UMT5Model(nnx.Module):
             encoder_hidden_states=hidden_states,
             encoder_attention_mask=attention_mask,
         )
+
+        decoder_outputs = shard(self.lm_head(decoder_outputs), self.config.shd_cfg.activation)
 
         return decoder_outputs
 
@@ -703,7 +755,7 @@ class UMT5Model(nnx.Module):
             )
 
             # Get logits and select next token (greedy)
-            logits = self.lm_head(decoder_outputs)
+            logits = shard(self.lm_head(decoder_outputs), self.config.shd_cfg.activation)
             # here use simple greedy, but beem search is recommended
             next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
 

@@ -518,10 +518,14 @@ class Qwen3VLVisionAttention(nnx.Module):
 
         q, k = self.apply_rope(cos, sin, q, k)
 
-        q, k, v = q.transpose(1, 0, 2), k.transpose(1, 0, 2), v.transpose(1, 0, 2)
-        attn_weights = jnp.matmul(q, k.transpose(0, 2, 1)) * self.scale
-        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
-        out = jnp.matmul(attn_weights, v).transpose(1, 0, 2).reshape(seq_len, -1)
+        from bonsai.utils.attention import flex_attention
+        # Add dummy batch dim to match (B, T, N, H)
+        q = q[None, ...]
+        k = k[None, ...]
+        v = v[None, ...]
+        
+        out = flex_attention(q, k, v, scale=self.scale, is_causal=False)[0]
+        out = out.reshape(seq_len, -1)
         return self.proj(out, out_sharding=P(None, None))
 
 
@@ -916,22 +920,10 @@ class Qwen3VLAttention(nnx.Module):
         k = shard(repeat_kv(cache.k_cache[...], self.n_rep), shd.act_btnh)
         v = shard(repeat_kv(cache.v_cache[...], self.n_rep), shd.act_btnh)
 
-        # Transpose to (B, heads, T, dim) and re-shard for attention
-        q = shard(q.transpose(0, 2, 1, 3), shd.act_bhsd)
-        k = shard(k.transpose(0, 2, 1, 3), shd.act_bhsd)
-        v = shard(v.transpose(0, 2, 1, 3), shd.act_bhsd)
-
-        # Attention: TP shards heads (axis 1), safe for any seq_len
-        attn_weights = shard(
-            jnp.matmul(q, k.transpose(0, 1, 3, 2)) * self.scale,
-            shd.attn_logit_shd,
-        )
-
-        if mask is not None:
-            attn_weights = jnp.where(mask, attn_weights, _K_MASK)
-        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
-        attn_out = shard(jnp.matmul(attn_weights, v), shd.act_bhsd)
-        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
+        from bonsai.utils.attention import flex_attention
+        # flex_attention expects (B, T, N, H)
+        attn_out = shard(flex_attention(q, k, v, custom_mask=mask, is_causal=False, scale=self.scale), shd.act_btd)
+        attn_out = attn_out.reshape(batch, seq_len, -1)
 
         cache.cur_ind[...] = cache.cur_ind[...] + seq_len
         return self.o_proj(attn_out, out_sharding=shd.act_btd)

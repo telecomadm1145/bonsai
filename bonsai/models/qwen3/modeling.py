@@ -303,11 +303,7 @@ class Attention(nnx.Module):
 
         b, t, n, h = query_proj.shape
 
-        # GQA reshape and attention logits
-        query_proj_gqa = query_proj.reshape((b, t, self.num_kv_heads, self.n_rep, h))
-        attn_logits = jnp.einsum("BTKGH,BSKH->BTSKG", query_proj_gqa, cache.k_cache[...]) * self.scale
-
-        # Masking and Softmax
+        # Masking
         q_pos = cache.cur_ind[...] + jnp.arange(t, dtype=jnp.int32)[None, :] - cache.start_ind[:, None]
         ts = jnp.arange(cache.size, dtype=jnp.int32)  # (cache.size,)
         kv_segment_ids = (ts[None, :] >= cache.start_ind[:, None]) & (ts[None, :] < cache.cur_ind[...] + t)
@@ -315,13 +311,16 @@ class Attention(nnx.Module):
         causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
         segment_mask = kv_segment_ids[:, None, :] == segment_ids[:, :, None]
         final_mask = causal_mask & segment_mask  # (B, T, S)
-        attn_mask = final_mask[:, :, :, None, None]
-        attn_logits = jnp.where(attn_mask, attn_logits, LARGE_NEGATIVE)
 
-        # Softmax
-        attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=2).astype(attn_logits.dtype)
-        qkv = jnp.einsum("BTSKG,BSKH->BTKGH", attn_weights, cache.v_cache[...])
-        qkv = qkv.reshape((b, t, n, h))
+        from bonsai.utils.attention import flex_attention
+        qkv = flex_attention(
+            query_proj,
+            cache.k_cache[...],
+            cache.v_cache[...],
+            is_causal=False,
+            custom_mask=final_mask[:, None, :, :],
+            scale=self.scale
+        )
 
         cache.cur_ind.set_value(cache.cur_ind[...] + t)
         return self.o_proj(qkv, out_sharding=self.shd_cfg.act_btd)

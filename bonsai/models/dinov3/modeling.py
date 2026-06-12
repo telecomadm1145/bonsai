@@ -1,9 +1,56 @@
 import dataclasses
+from enum import Enum
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax import Array
+from jax import Array, P
+from jax.sharding import PartitionSpec, reshard
+
+
+class ShardMode(Enum):
+    FSDP = "fsdp"
+    TP = "tp"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ShardConfig:
+    emb_patch_kernel: PartitionSpec | None = None
+    emb_patch_activation: PartitionSpec | None = None
+    emb_pos: PartitionSpec | None = None
+    attn_kernel: PartitionSpec | None = None
+    attn_qk_activation: PartitionSpec | None = None
+    fc1_kernel: PartitionSpec | None = None
+    fc2_kernel: PartitionSpec | None = None
+    activation: PartitionSpec | None = None
+    layer_norm: PartitionSpec | None = None
+
+    @staticmethod
+    def no_sharding():
+        return ShardConfig()
+
+    @staticmethod
+    def default(use_fsdp: bool, use_tp: bool):
+        fsdp = ShardMode.FSDP.value if use_fsdp else None
+        tp = ShardMode.TP.value if use_tp else None
+        return ShardConfig(
+            emb_patch_kernel=P(None, None, None, tp),
+            emb_patch_activation=P(fsdp, None, None, tp),
+            emb_pos=P(None, None, tp),
+            attn_kernel=P(tp, fsdp),
+            attn_qk_activation=P(fsdp, tp),
+            fc1_kernel=P(fsdp, tp),
+            fc2_kernel=P(tp, fsdp),
+            activation=P(fsdp, None, tp),
+            layer_norm=P(tp),
+        )
+
+
+def shard(x: jnp.ndarray, s: PartitionSpec | None):
+    if s is None:
+        return x
+    else:
+        return reshard(x, s)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26,64 +73,81 @@ class ModelConfig:
     layerscale_value: float = 1.0
     use_gated_mlp: bool = False
     num_register_tokens: int = 4
+    shd_cfg: ShardConfig = ShardConfig.no_sharding()
 
     @classmethod
-    def dinov3_vits16(cls):
-        return cls()
+    def _from_param(cls, use_fsdp: bool = False, use_tp: bool = False, **kwargs):
+        if use_fsdp or use_tp:
+            kwargs["shd_cfg"] = ShardConfig.default(use_fsdp=use_fsdp, use_tp=use_tp)
+        return cls(**kwargs)
 
     @classmethod
-    def dinov3_vits16plus(cls):
-        return cls(
+    def dinov3_vits16(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(use_fsdp=use_fsdp, use_tp=use_tp)
+
+    @classmethod
+    def dinov3_vits16plus(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(
             hidden_size=384,
             intermediate_size=1536,
             num_hidden_layers=12,
             num_attention_heads=6,
             hidden_act="silu",
             use_gated_mlp=True,
+            use_fsdp=use_fsdp,
+            use_tp=use_tp,
         )
 
     @classmethod
-    def dinov3_vitb16(cls):
-        return cls(
+    def dinov3_vitb16(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(
             hidden_size=768,
             intermediate_size=3072,
             num_hidden_layers=12,
             num_attention_heads=12,
             hidden_act="gelu",
             use_gated_mlp=False,
+            use_fsdp=use_fsdp,
+            use_tp=use_tp,
         )
 
     @classmethod
-    def dinov3_vitl16(cls):
-        return cls(
+    def dinov3_vitl16(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(
             hidden_size=1024,
             intermediate_size=4096,
             num_hidden_layers=24,
             num_attention_heads=16,
             hidden_act="gelu",
             use_gated_mlp=False,
+            use_fsdp=use_fsdp,
+            use_tp=use_tp,
         )
 
     @classmethod
-    def dinov3_vith16plus(cls):
-        return cls(
+    def dinov3_vith16plus(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(
             hidden_size=1280,
             intermediate_size=5120,
             num_hidden_layers=32,
             num_attention_heads=20,
             hidden_act="silu",
             use_gated_mlp=True,
+            use_fsdp=use_fsdp,
+            use_tp=use_tp,
         )
 
     @classmethod
-    def dinov3_vit7b16(cls):
-        return cls(
+    def dinov3_vit7b16(cls, use_fsdp: bool = False, use_tp: bool = False):
+        return cls._from_param(
             hidden_size=4096,
             intermediate_size=8192,
             num_hidden_layers=40,
             num_attention_heads=32,
             hidden_act="silu",
             use_gated_mlp=True,
+            use_fsdp=use_fsdp,
+            use_tp=use_tp,
         )
 
 
@@ -92,16 +156,18 @@ class DINOv3ViTEmbeddings(nnx.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.cls_token = nnx.Param(jnp.ones((1, 1, self.hidden_size), dtype=jnp.float32))
-        self.mask_token = nnx.Param(jnp.zeros((1, 1, self.hidden_size), dtype=jnp.float32))
+        shd = config.shd_cfg.emb_pos
+        self.cls_token = nnx.Param(shard(jnp.ones((1, 1, self.hidden_size), dtype=jnp.float32), shd))
+        self.mask_token = nnx.Param(shard(jnp.zeros((1, 1, self.hidden_size), dtype=jnp.float32), shd))
         self.register_tokens = nnx.Param(
-            jnp.zeros((1, config.num_register_tokens, config.hidden_size), dtype=jnp.float32)
+            shard(jnp.zeros((1, config.num_register_tokens, config.hidden_size), dtype=jnp.float32), shd)
         )
         self.patch_embeddings = nnx.Conv(
             in_features=config.num_channels,
             out_features=config.hidden_size,
             kernel_size=config.patch_size,
             strides=config.patch_size,
+            kernel_metadata={"out_sharding": config.shd_cfg.emb_patch_kernel},
             rngs=rngs,
         )
 
@@ -111,13 +177,14 @@ class DINOv3ViTEmbeddings(nnx.Module):
         # B C H W -> B Patches D
         pixel_values = pixel_values.transpose(0, 2, 3, 1)
         patch_embeddings = self.patch_embeddings(pixel_values)
+        patch_embeddings = shard(patch_embeddings, self.config.shd_cfg.emb_patch_activation)
         patch_embeddings = patch_embeddings.reshape(b, -1, self.hidden_size)
 
         cls_token = jnp.broadcast_to(self.cls_token[...], (b, 1, self.hidden_size))
         register_tokens = jnp.broadcast_to(
             self.register_tokens[...], (b, self.config.num_register_tokens, self.hidden_size)
         )
-        return jnp.concat([cls_token, register_tokens, patch_embeddings], axis=1)
+        return shard(jnp.concat([cls_token, register_tokens, patch_embeddings], axis=1), self.config.shd_cfg.activation)
 
 
 class Dinov3ViTRopePositionEmbedding(nnx.Module):
@@ -194,26 +261,31 @@ class Dinov3ViTAttention(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
+        shd = config.shd_cfg
 
         self.q_proj = nnx.Linear(
-            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.query_bias, rngs=rngs
+            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.query_bias,
+            kernel_metadata={"out_sharding": shd.attn_kernel}, rngs=rngs
         )
         self.k_proj = nnx.Linear(
-            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.key_bias, rngs=rngs
+            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.key_bias,
+            kernel_metadata={"out_sharding": shd.attn_kernel}, rngs=rngs
         )
         self.v_proj = nnx.Linear(
-            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.value_bias, rngs=rngs
+            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.value_bias,
+            kernel_metadata={"out_sharding": shd.attn_kernel}, rngs=rngs
         )
         self.o_proj = nnx.Linear(
-            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.proj_bias, rngs=rngs
+            in_features=config.hidden_size, out_features=config.hidden_size, use_bias=config.proj_bias,
+            kernel_metadata={"out_sharding": shd.attn_kernel}, rngs=rngs
         )
 
     def __call__(self, hidden_states: Array, position_embeddings: tuple[Array, Array]) -> Array:
         batch_size, patches, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = shard(self.q_proj(hidden_states), self.config.shd_cfg.activation)
+        key_states = shard(self.k_proj(hidden_states), self.config.shd_cfg.activation)
+        value_states = shard(self.v_proj(hidden_states), self.config.shd_cfg.activation)
 
         n_heads = self.config.num_attention_heads
         head_dim = self.config.hidden_size // n_heads
@@ -228,60 +300,73 @@ class Dinov3ViTAttention(nnx.Module):
         scale = self.config.hidden_size // self.config.num_attention_heads
         scale = 1.0 / jnp.sqrt(scale)
 
-        # (B, H, P, D) @ (B, H, D, P) -> (B, H, P, P)
-        attn_weights = jnp.matmul(query_states, key_states.transpose(0, 1, 3, 2)) * scale
-        attn_weights = nnx.softmax(attn_weights, axis=-1)
+        from bonsai.utils.attention import flex_attention
+        hidden_states = flex_attention(
+            query_states.transpose(0, 2, 1, 3),
+            key_states.transpose(0, 2, 1, 3),
+            value_states.transpose(0, 2, 1, 3),
+            is_causal=False,
+            scale=scale
+        )
+        hidden_states = shard(hidden_states, self.config.shd_cfg.attn_qk_activation)
 
-        # (B, H, P, P) @ (B, H, P, D) -> (B, H, P, D)
-        hidden_states = jnp.matmul(attn_weights, value_states)
-
-        hidden_states = hidden_states.transpose(0, 2, 1, 3).reshape(batch_size, patches, -1)
+        hidden_states = hidden_states.reshape(batch_size, patches, -1)
         hidden_states = self.o_proj(hidden_states)
-        return hidden_states
+        return shard(hidden_states, self.config.shd_cfg.activation)
 
 
 class Dinov3MLP(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
+        shd = config.shd_cfg
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.up_proj = nnx.Linear(self.hidden_size, self.intermediate_size, rngs=rngs)
-        self.down_proj = nnx.Linear(self.intermediate_size, self.hidden_size, rngs=rngs)
+        self.up_proj = nnx.Linear(self.hidden_size, self.intermediate_size, kernel_metadata={"out_sharding": shd.fc1_kernel}, rngs=rngs)
+        self.down_proj = nnx.Linear(self.intermediate_size, self.hidden_size, kernel_metadata={"out_sharding": shd.fc2_kernel}, rngs=rngs)
         if config.hidden_act == "gelu":
             self.act_fn = nnx.gelu
         elif config.hidden_act == "silu":
             self.act_fn = nnx.silu
 
     def __call__(self, x):
-        return self.down_proj(self.act_fn(self.up_proj(x)))
+        x = shard(self.up_proj(x), self.config.shd_cfg.activation)
+        x = self.down_proj(self.act_fn(x))
+        return shard(x, self.config.shd_cfg.activation)
 
 
 class Dinov3GatedMLP(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
         super().__init__()
         self.config = config
+        shd = config.shd_cfg
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nnx.Linear(self.hidden_size, self.intermediate_size, use_bias=config.mlp_bias, rngs=rngs)
-        self.up_proj = nnx.Linear(self.hidden_size, self.intermediate_size, use_bias=config.mlp_bias, rngs=rngs)
-        self.down_proj = nnx.Linear(self.intermediate_size, self.hidden_size, use_bias=config.mlp_bias, rngs=rngs)
+        self.gate_proj = nnx.Linear(self.hidden_size, self.intermediate_size, use_bias=config.mlp_bias, kernel_metadata={"out_sharding": shd.fc1_kernel}, rngs=rngs)
+        self.up_proj = nnx.Linear(self.hidden_size, self.intermediate_size, use_bias=config.mlp_bias, kernel_metadata={"out_sharding": shd.fc1_kernel}, rngs=rngs)
+        self.down_proj = nnx.Linear(self.intermediate_size, self.hidden_size, use_bias=config.mlp_bias, kernel_metadata={"out_sharding": shd.fc2_kernel}, rngs=rngs)
         if config.hidden_act == "gelu":
             self.act_fn = nnx.gelu
         elif config.hidden_act == "silu":
             self.act_fn = nnx.silu
 
     def __call__(self, x):
-        x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return x
+        gate = shard(self.gate_proj(x), self.config.shd_cfg.activation)
+        up = shard(self.up_proj(x), self.config.shd_cfg.activation)
+        x = self.down_proj(self.act_fn(gate) * up)
+        return shard(x, self.config.shd_cfg.activation)
 
 
 class Dinov3ViTLayer(nnx.Module):
     def __init__(self, config: ModelConfig, rngs: nnx.Rngs):
-        self.norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        from functools import partial
+        shd = config.shd_cfg.layer_norm
+        si = partial(jax.nn.initializers.ones, out_sharding=shd)
+        bi = partial(jax.nn.initializers.zeros, out_sharding=shd)
+        self.norm1 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=si, bias_init=bi, rngs=rngs)
         self.attention = Dinov3ViTAttention(config, rngs=rngs)
         self.layer_scale1 = Dinov3LayerScale(config)
-        self.norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=si, bias_init=bi, rngs=rngs)
         if config.use_gated_mlp:
             self.mlp = Dinov3GatedMLP(config, rngs=rngs)
         else:
@@ -311,7 +396,12 @@ class Dinov3ViTModel(nnx.Module):
         self.embeddings = DINOv3ViTEmbeddings(config, rngs=rngs)
         self.rope_embeddings = Dinov3ViTRopePositionEmbedding(config)
         self.layer = nnx.List([Dinov3ViTLayer(config, rngs=rngs) for _ in range(config.num_hidden_layers)])
-        self.norm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
+        
+        from functools import partial
+        shd = config.shd_cfg.layer_norm
+        si = partial(jax.nn.initializers.ones, out_sharding=shd)
+        bi = partial(jax.nn.initializers.zeros, out_sharding=shd)
+        self.norm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, scale_init=si, bias_init=bi, rngs=rngs)
 
     def __call__(self, pixel_values: Array):
         hidden_states = self.embeddings(pixel_values)
