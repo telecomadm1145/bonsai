@@ -7,6 +7,8 @@ from flax import nnx
 from jax import Array, P
 from jax.sharding import PartitionSpec, reshard
 
+from bonsai.utils.attention import flex_attention
+
 class ShardMode(Enum):
     FSDP = "fsdp"
     TP = "tp"
@@ -283,26 +285,26 @@ class VJEPA2RopeAttention(nnx.Module):
         key_layer = shard(self.key(hidden_states), self.shd.activation)
         value_layer = shard(self.value(hidden_states), self.shd.activation)
 
+        # Reshape to BSNH for RoPE (which operates on BNSH internally)
         query_layer = query_layer.reshape(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
-        query_layer = query_layer.transpose(0, 2, 1, 3)
+        query_layer = query_layer.transpose(0, 2, 1, 3)  # → BNSH for RoPE
 
         key_layer = key_layer.reshape(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
         key_layer = key_layer.transpose(0, 2, 1, 3)
 
         value_layer = value_layer.reshape(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
-        value_layer = value_layer.transpose(0, 2, 1, 3)
 
         pos_ids = self.get_position_ids(hidden_states, masks=position_mask)
-        query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
-        key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
+        query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)  # BNSH
+        key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)      # BNSH
 
-        from bonsai.utils.attention import flex_attention
+        # flex_attention expects BTNH (= BSNH)
         context_layer = flex_attention(
-            query_layer.transpose(0, 2, 1, 3),
-            key_layer.transpose(0, 2, 1, 3),
-            value_layer.transpose(0, 2, 1, 3),
+            query_layer.transpose(0, 2, 1, 3),  # BNSH → BSNH
+            key_layer.transpose(0, 2, 1, 3),    # BNSH → BSNH
+            value_layer,                          # already BSNH
             scale=self.scaling,
-            is_causal=False
+            is_causal=False,
         )
         context_layer = shard(context_layer, self.shd.attn_qk_activation)
         context_layer = context_layer.reshape(batch_size, seq_length, self.all_head_size)
@@ -503,16 +505,16 @@ class VJEPA2PoolerSelfAttention(nnx.Module):
         keys = shard(self.k_proj(hidden_states), self.shd.activation)
         values = shard(self.v_proj(hidden_states), self.shd.activation)
 
-        from bonsai.utils.attention import flex_attention
+        # flex_attention expects BTNH (= BSNH)
         attn_output = flex_attention(
-            queries.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
-            keys.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
-            values.reshape(batch_size, seq_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3),
+            queries.reshape(batch_size, seq_length, self.num_heads, self.head_dim),
+            keys.reshape(batch_size, seq_length, self.num_heads, self.head_dim),
+            values.reshape(batch_size, seq_length, self.num_heads, self.head_dim),
             scale=self.scale,
-            is_causal=False
+            is_causal=False,
         )
         attn_output = shard(attn_output, self.shd.attn_qk_activation)
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.embed_dim)
+        attn_output = attn_output.reshape(batch_size, seq_length, self.embed_dim)
 
         attn_output = shard(self.out_proj(attn_output), self.shd.activation)
 
@@ -540,13 +542,12 @@ class VJEPA2PoolerCrossAttention(nnx.Module):
         keys = shard(self.k_proj(keys), self.shd.activation)
         values = shard(self.v_proj(values), self.shd.activation)
 
-        from bonsai.utils.attention import flex_attention
         attn_output = flex_attention(
             queries.reshape(batch_size, q_seq_length, self.num_heads, self.head_dim),
             keys.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim),
             values.reshape(batch_size, kv_seq_length, self.num_heads, self.head_dim),
             scale=self.scale,
-            is_causal=False
+            is_causal=False,
         )
         attn_output = shard(attn_output, self.shd.attn_qk_activation)
         attn_output = attn_output.reshape(batch_size, q_seq_length, self.embed_dim)

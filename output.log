@@ -1,0 +1,7 @@
+Starting test
+ERROR: Traceback (most recent call last):
+  File "/kaggle/src/script.py", line 12, in <module>
+    subprocess.run([sys.executable, "-m", "pip", "install", "-e", "./bonsai"], check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/usr/bin/python3', '-m', 'pip', 'install', '-e', './bonsai']' returned non-zero exit status 1.

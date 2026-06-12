@@ -10,6 +10,8 @@ from flax import nnx
 from jax import P
 from jax.sharding import PartitionSpec, reshard
 
+from bonsai.utils.attention import flex_attention
+
 class ShardMode(Enum):
     FSDP = "fsdp"
     TP = "tp"
@@ -159,18 +161,7 @@ class DownEncoderBlock2D(nnx.Module):
         return x
 
 
-def scaled_dot_product_attention(query, key, value):
-    d_k = query.shape[-1]
-    scale_factor = 1.0 / jnp.sqrt(d_k)
 
-    attention_scores = jnp.einsum("bhld,bhsd->bhls", query, key)
-
-    attention_scores *= scale_factor
-    attention_weights = jax.nn.softmax(attention_scores, axis=-1)
-
-    output = jnp.einsum("bhls,bhsd->bhld", attention_weights, value)
-
-    return output
 
 
 class Attention(nnx.Module):
@@ -215,7 +206,6 @@ class Attention(nnx.Module):
         key = key.reshape(batch_size, -1, heads, head_dim)
         value = value.reshape(batch_size, -1, heads, head_dim)
 
-        from bonsai.utils.attention import flex_attention
         hidden_states = flex_attention(query, key, value, is_causal=False)
         hidden_states = shard(hidden_states, self.shd.attn_qk_activation)
 

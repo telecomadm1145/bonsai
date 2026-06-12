@@ -25,6 +25,8 @@ from jax._src.typing import DTypeLike
 from jax.lax import Precision
 from jax.sharding import PartitionSpec, reshard
 
+from bonsai.utils.attention import flex_attention
+
 class ShardMode(Enum):
     FSDP = "fsdp"
     TP = "tp"
@@ -374,7 +376,6 @@ class UMT5Attention(nnx.Module):
         if attention_mask is not None:
             position_bias = position_bias + attention_mask
 
-        from bonsai.utils.attention import flex_attention
         o_attn = flex_attention(q, k, v, bias=position_bias, is_causal=False)
         o_attn = shard(o_attn, self.config.shd_cfg.attn_qk_activation)
         o_attn = o_attn.reshape(b, -1, n * c)

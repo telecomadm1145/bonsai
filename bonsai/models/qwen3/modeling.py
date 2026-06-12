@@ -24,6 +24,8 @@ from jax import P
 from jax.sharding import PartitionSpec, get_abstract_mesh, reshard
 from jaxtyping import Array, ArrayLike
 
+from bonsai.utils.attention import flex_attention
+
 LARGE_NEGATIVE = jnp.finfo(jnp.bfloat16).min
 
 
@@ -312,14 +314,13 @@ class Attention(nnx.Module):
         segment_mask = kv_segment_ids[:, None, :] == segment_ids[:, :, None]
         final_mask = causal_mask & segment_mask  # (B, T, S)
 
-        from bonsai.utils.attention import flex_attention
         qkv = flex_attention(
             query_proj,
             cache.k_cache[...],
             cache.v_cache[...],
             is_causal=False,
-            custom_mask=final_mask[:, None, :, :],
-            scale=self.scale
+            mask=final_mask[:, None, :, :],
+            scale=self.scale,
         )
 
         cache.cur_ind.set_value(cache.cur_ind[...] + t)

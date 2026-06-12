@@ -1,0 +1,48 @@
+Starting test
+ERROR: Traceback (most recent call last):
+  File "/kaggle/src/script.py", line 20, in <module>
+    from bonsai.models.umt5.tests.run_model import main
+  File "/kaggle/working/bonsai/bonsai/models/__init__.py", line 6, in <module>
+    from bonsai.models.llada.modeling import LLaDAModel, ModelConfig as LLaDAModelConfig
+  File "/kaggle/working/bonsai/bonsai/models/llada/modeling.py", line 411, in <module>
+    key: Array = jax.random.key(0),
+                 ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/random.py", line 257, in key
+    return _key('key', seed, impl)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/random.py", line 229, in _key
+    return prng.random_seed(seed, impl=impl)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/prng.py", line 564, in random_seed
+    seeds_arr = jnp.asarray(np.int64(seeds))
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/numpy/array_constructors.py", line 452, in asarray
+    return array(a, dtype=dtype, copy=bool(copy), order=order, device=device,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/numpy/array_constructors.py", line 205, in array
+    return lax.stage(object)
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/lax/lax.py", line 1604, in stage
+    return stage_p.bind(x)
+           ^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/core.py", line 641, in bind
+    return self.bind_with_trace(prev_trace, args, avals, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/lax/lax.py", line 5311, in _stage_bind_with_trace
+    return trace.stage_value(args[0])
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/core.py", line 1210, in stage_value
+    return self.process_primitive(stage_p, [val], {})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/core.py", line 1221, in process_primitive
+    return primitive.impl(*args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/lax/lax.py", line 5301, in _stage_impl
+    return dispatch.apply_primitive(stage_p, x)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/dispatch.py", line 89, in apply_primitive
+    outs = fun(*args)
+           ^^^^^^^^^^
+jax.errors.JaxRuntimeError: INVALID_ARGUMENT: Unexpected PJRT_FFI_UserData_Add_Args size: expected 48, got 40. The plugin is likely built with a later version than the framework. This plugin is built with PJRT API version 0.76.
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.

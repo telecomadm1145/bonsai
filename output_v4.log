@@ -1,0 +1,5 @@
+Starting test
+ERROR: Traceback (most recent call last):
+  File "/kaggle/src/script.py", line 22, in <module>
+    from bonsai.models.dinov3.modeling import Dinov3Model
+ImportError: cannot import name 'Dinov3Model' from 'bonsai.models.dinov3.modeling' (/kaggle/working/bonsai/bonsai/models/dinov3/modeling.py)

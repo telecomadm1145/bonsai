@@ -23,6 +23,8 @@ from flax import nnx
 from jax import Array, P
 from jax.sharding import PartitionSpec, get_abstract_mesh, reshard
 
+from bonsai.utils.attention import flex_attention
+
 _K_MASK = jnp.finfo(jnp.bfloat16).min
 
 
@@ -518,12 +520,11 @@ class Qwen3VLVisionAttention(nnx.Module):
 
         q, k = self.apply_rope(cos, sin, q, k)
 
-        from bonsai.utils.attention import flex_attention
         # Add dummy batch dim to match (B, T, N, H)
         q = q[None, ...]
         k = k[None, ...]
         v = v[None, ...]
-        
+
         out = flex_attention(q, k, v, scale=self.scale, is_causal=False)[0]
         out = out.reshape(seq_len, -1)
         return self.proj(out, out_sharding=P(None, None))
@@ -920,9 +921,8 @@ class Qwen3VLAttention(nnx.Module):
         k = shard(repeat_kv(cache.k_cache[...], self.n_rep), shd.act_btnh)
         v = shard(repeat_kv(cache.v_cache[...], self.n_rep), shd.act_btnh)
 
-        from bonsai.utils.attention import flex_attention
         # flex_attention expects (B, T, N, H)
-        attn_out = shard(flex_attention(q, k, v, custom_mask=mask, is_causal=False, scale=self.scale), shd.act_btd)
+        attn_out = shard(flex_attention(q, k, v, mask=mask, is_causal=False, scale=self.scale), shd.act_btd)
         attn_out = attn_out.reshape(batch, seq_len, -1)
 
         cache.cur_ind[...] = cache.cur_ind[...] + seq_len

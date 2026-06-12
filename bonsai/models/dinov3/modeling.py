@@ -7,6 +7,8 @@ from flax import nnx
 from jax import Array, P
 from jax.sharding import PartitionSpec, reshard
 
+from bonsai.utils.attention import flex_attention
+
 
 class ShardMode(Enum):
     FSDP = "fsdp"
@@ -290,23 +292,23 @@ class Dinov3ViTAttention(nnx.Module):
         n_heads = self.config.num_attention_heads
         head_dim = self.config.hidden_size // n_heads
 
+        # Reshape to BNSH for RoPE
         query_states = query_states.reshape(batch_size, patches, n_heads, head_dim).transpose(0, 2, 1, 3)
         key_states = key_states.reshape(batch_size, patches, n_heads, head_dim).transpose(0, 2, 1, 3)
-        value_states = value_states.reshape(batch_size, patches, n_heads, head_dim).transpose(0, 2, 1, 3)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        scale = self.config.hidden_size // self.config.num_attention_heads
-        scale = 1.0 / jnp.sqrt(scale)
+        # Transpose back to BTNH for flex_attention
+        value_states = value_states.reshape(batch_size, patches, n_heads, head_dim)
+        scale = 1.0 / jnp.sqrt(head_dim)
 
-        from bonsai.utils.attention import flex_attention
         hidden_states = flex_attention(
-            query_states.transpose(0, 2, 1, 3),
-            key_states.transpose(0, 2, 1, 3),
-            value_states.transpose(0, 2, 1, 3),
+            query_states.transpose(0, 2, 1, 3),  # BNSH -> BTNH
+            key_states.transpose(0, 2, 1, 3),    # BNSH -> BTNH
+            value_states,                          # already BTNH
             is_causal=False,
-            scale=scale
+            scale=scale,
         )
         hidden_states = shard(hidden_states, self.config.shd_cfg.attn_qk_activation)
 
