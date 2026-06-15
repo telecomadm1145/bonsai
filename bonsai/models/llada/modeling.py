@@ -181,8 +181,6 @@ class RMSNorm(nnx.Module):
         out = out * self.weight[...].astype(jnp.float32)
         return out.astype(dtype)
 
-
-def sharded_attention(
 class LLaDALlamaBlock(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.config = cfg
