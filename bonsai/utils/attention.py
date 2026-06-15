@@ -170,13 +170,9 @@ def flex_attention(
         k = key.transpose(0, 2, 1, 3)
         v = value.transpose(0, 2, 1, 3)
 
-        # Broadcast GQA → MHA (splash requires equal head counts).
-        B, N, T, H = q.shape
-        _, K, S, _ = k.shape
-        if K != N:
-            assert N % K == 0
-            k = jnp.repeat(k, N // K, axis=1)
-            v = jnp.repeat(v, N // K, axis=1)
+        # Splash attention natively supports GQA: when num_q_heads != num_kv_heads,
+        # the kernel internally reshapes Q into (kv_heads, q_heads_per_kv_head, ...)
+        # and uses nested vmaps. No need to replicate K/V.
 
         out = _splash_attention(
             q, k, v,
